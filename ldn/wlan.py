@@ -17,11 +17,12 @@ from netlink import nl80211, route
 from ldn import streams, util, queue
 
 import contextlib
-import fcntl
 import netlink
+import os
 import socket
 import string
 import struct
+import sys
 import trio
 import typing
 
@@ -1011,9 +1012,11 @@ class Interface:
     
     def disable_ipv6(self) -> None:
         """Disables IPv6 on the interface."""
-        filename = f"/proc/sys/net/ipv6/conf/{self._name}/disable_ipv6"
-        with open(filename, "w") as f:
-            f.write("1")
+        # ipv6 is disabled in the lkl build
+        if os.name.startswith("linux"):
+            filename = f"/proc/sys/net/ipv6/conf/{self._name}/disable_ipv6"
+            with open(filename, "w") as f:
+                f.write("1")
     
     def name(self) -> str:
         return self._name
@@ -1030,6 +1033,11 @@ class Interface:
         """Marks the interface as 'up', changing it to a running state."""
         await self._router.update_link(
             socket.AF_UNSPEC, 0, self._index, IFF_UP, IFF_UP, {}
+        )
+
+    async def down(self) -> None:
+        await self._router.update_link(
+            socket.AF_UNSPEC, 0, self._index, 0, IFF_UP, {}
         )
     
     async def update_link(self, address: MACAddress) -> None:
@@ -1100,39 +1108,52 @@ class Monitor(Interface):
     channels and filtering based on the BSSID.
     """
 
-    _socket: trio.socket.SocketType
+    _socket: typing.Any
+    _daemon: typing.Any | None
 
     _filter: MACAddress | None
     _lock: trio.Lock
-    
+
     def __init__(
         self, wlan: nl80211.NL80211, router: route.RouteController, name: str,
-        index: int, address: MACAddress
+        index: int, address: MACAddress, daemon: typing.Any | None = None
     ):
         super().__init__(wlan, router, name, index, address)
 
-        self._socket = trio.socket.socket(
-            socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ETH_P_ALL)
-        )
+        self._daemon = daemon
+        if self._daemon is None:
+            self._socket = trio.socket.socket(
+                socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ETH_P_ALL)
+            )
 
         self._filter = None
         self._lock = trio.Lock()
-    
+
     def set_filter(self, filter: MACAddress | str | None) -> None:
         """This method can be used to filter incoming frames on BSSID."""
         if isinstance(filter, str):
             filter = MACAddress(filter)
-        
+
         self._filter = filter
-    
-    async def activate(self) -> None:
+
+    async def activate(self, channel: int | None = None) -> None:
         """
         Ensures that the raw socket is bound to the underlying interface. This
         method must be called exactly once before radiotap frames can be
         received.
         """
         await self.up()
-        await self._socket.bind((self.name(), 0))
+        if channel is not None:
+            await self.set_channel(channel)
+        if self._daemon is not None:
+            from ldn.daemon_client import client
+            self._socket = await self._daemon.open(
+                client.AF_PACKET, client.SOCK_RAW, socket.htons(ETH_P_ALL)
+            )
+            await self._socket.bind(client.pack_sockaddr_ll(ETH_P_ALL, self.index()))
+            await self._socket.startup()
+        else:
+            await self._socket.bind((self.name(), 0))
     
     async def recv(self) -> RadiotapFrame:
         """
@@ -1209,21 +1230,25 @@ class Station(Interface):
 
     _host_address: MACAddress | None
 
+    _daemon: typing.Any | None
+
     _events: queue.Queue[EventType]
-    
+
     def __init__(
         self, wlan: nl80211.NL80211, router: route.RouteController, name: str,
         index: int, address: MACAddress, ssid: str, channel: int,
-        key: bytes | None
+        key: bytes | None, daemon: typing.Any | None = None
     ):
         super().__init__(wlan, router, name, index, address)
-        
+
         self._ssid = ssid
         self._channel = channel
         self._key = key
-        
+
         self._host_address = None
-        
+
+        self._daemon = daemon
+
         self._events = queue.create()
     
     async def next_event(self) -> EventType:
@@ -1387,6 +1412,19 @@ class Station(Interface):
             nl80211.NL80211_ATTR_STA_FLAGS2: struct.pack("II", flag, flag)
         }
         await self._wlan.request(nl80211.NL80211_CMD_SET_STATION, attrs)
+
+    async def create_packet_socket(self):
+        if self._daemon is None:
+            raise RuntimeError(
+                "create_packet_socket requires a daemon connection"
+            )
+        from ldn.daemon_client import client
+        channel = await self._daemon.open(
+            client.AF_PACKET, client.SOCK_RAW, socket.htons(ETH_P_ALL)
+        )
+        await channel.bind(client.pack_sockaddr_ll(ETH_P_ALL, self.index()))
+        await channel.startup()
+        return channel
 
 
 class AccessPoint(Interface):
@@ -1802,35 +1840,37 @@ class Factory:
 
     _wlan: nl80211.NL80211
     _router: route.RouteController
-    
-    def __init__(self, wlan: nl80211.NL80211, router: route.RouteController):
+    _daemon: typing.Any | None
+
+    def __init__(
+        self, wlan: nl80211.NL80211, router: route.RouteController,
+        daemon: typing.Any | None = None
+    ):
         self._wlan = wlan
         self._wlan.add_membership("mlme")
 
         self._router = router
-    
+        self._daemon = daemon
+
     @contextlib.asynccontextmanager
     async def create_monitor(
         self, phyname: str, ifname: str, channel: int | None = None
     ) -> AsyncIterator[Monitor]:
-        """
-        Creates an interface in monitor mode on the given phy with the given
-        name. If a channel is provided, the phy is immediately switched to the
-        given channel.
-        """
         flags = {
             nl80211.NL80211_ATTR_MNTR_FLAGS: {
                 nl80211.NL80211_MNTR_FLAG_OTHER_BSS: True
             }
         }
         async with self._create_interface(
-            phyname, ifname, nl80211.NL80211_IFTYPE_MONITOR, flags
+            phyname, ifname, nl80211.NL80211_IFTYPE_MONITOR, flags,
+            exclusive=True
         ) as attributes:
             index = attributes[nl80211.NL80211_ATTR_IFINDEX]
             address = MACAddress(attributes[nl80211.NL80211_ATTR_MAC])
-            
-            monitor = Monitor(self._wlan, self._router, ifname, index, address)
-            await monitor.activate()
+            monitor = Monitor(
+                self._wlan, self._router, ifname, index, address, self._daemon
+            )
+            await monitor.activate(channel)
             yield monitor
     
     @contextlib.asynccontextmanager
@@ -1849,7 +1889,7 @@ class Factory:
 
             sta = Station(
                 self._wlan, self._router, ifname, index, address, ssid, channel,
-                key
+                key, self._daemon
             )
             async with sta.connect():
                 yield sta
@@ -1879,6 +1919,7 @@ class Factory:
     async def create_tap(
         self, ifname: str, address: MACAddress
     ) -> AsyncIterator[Tap]:
+        import fcntl
         file = await trio.open_file("/dev/net/tun", "rb+", buffering=0)
         async with file:
             request = struct.pack("16sH", ifname.encode(), IFF_TAP | IFF_NO_PI)
@@ -1888,11 +1929,36 @@ class Factory:
             await tap.update_link(address)
             await tap.up()
             yield tap
-    
+
+    async def _delete_phy_interfaces(self, wiphy: int) -> None:
+        messages = await self._wlan.request(
+            nl80211.NL80211_CMD_GET_INTERFACE, flags=netlink.NLM_F_DUMP
+        )
+        for message in messages:
+            attributes = message.attributes
+            if attributes.get(nl80211.NL80211_ATTR_WIPHY) != wiphy:
+                continue
+            index = attributes.get(nl80211.NL80211_ATTR_IFINDEX)
+            if index is None:
+                continue
+            if not sys.platform.startswith("linux"):
+                try:
+                    await self._router.update_link(
+                        socket.AF_UNSPEC, 0, index, 0, IFF_UP, {}
+                    )
+                except Exception as ex:
+                    # TOOD: Logger
+                    print("[warn] [ldn]", ex)
+                    pass
+            await self._wlan.request(
+                nl80211.NL80211_CMD_DEL_INTERFACE,
+                {nl80211.NL80211_ATTR_IFINDEX: index}
+            )
+
     @contextlib.asynccontextmanager
     async def _create_interface(
         self, phyname: str, ifname: str, type: int,
-        extra: dict[int, typing.Any] = {}
+        extra: dict[int, typing.Any] = {}, exclusive: bool = False
     ) -> AsyncIterator[dict[int, typing.Any]]:
         """
         Creates an interface on the given phy, with the given name, type and
@@ -1903,6 +1969,9 @@ class Factory:
         Returns the attributes of the newly created interface.
         """
         wiphy = await self._get_wiphy_index(phyname)
+
+        if exclusive:
+            await self._delete_phy_interfaces(wiphy)
 
         attrs = {
             nl80211.NL80211_ATTR_WIPHY: wiphy,
@@ -1919,8 +1988,22 @@ class Factory:
         try:
             yield attributes
         finally:
+            # On the Windows LKL daemon a running monitor can crash in mt76
+            # drv_stop if it is deleted while RX is still active. Bring the
+            # interface down first so the driver stops RX, then delete it.
+            if not sys.platform.startswith("linux"):
+                try:
+                    await self._router.update_link(
+                        socket.AF_UNSPEC, 0, index, 0, IFF_UP, {}
+                    )
+                except Exception:
+                    pass
             attrs = {nl80211.NL80211_ATTR_IFINDEX: index}
-            await self._wlan.request(nl80211.NL80211_CMD_DEL_INTERFACE, attrs)
+            try:
+                await self._wlan.request(nl80211.NL80211_CMD_DEL_INTERFACE, attrs)
+            except Exception:
+                if not sys.platform.startswith("linux"):
+                    raise
     
     async def _get_wiphy_index(self, name: str) -> int:
         """Returns the PHY index with the given name."""
@@ -1934,11 +2017,21 @@ class Factory:
 
 
 @contextlib.asynccontextmanager
-async def create_factory() -> AsyncIterator[Factory]:
+async def create_factory(ldnd_socket: typing.Optional[str]) -> AsyncIterator[Factory]:
     """
     Establishes an nl80211 connection with the kernel and returns a factory for
     wireless interfaces.
     """
-    async with nl80211.connect() as wlan:
-        async with route.connect() as router:
-            yield Factory(wlan, router)
+    if not ldnd_socket and not os.name.startswith("linux"):
+        raise Exception("Non linux needs socket/pipe name to ldnd")
+
+    if ldnd_socket:
+        from ldn.daemon_client import client
+        async with client.daemon_connect(ldnd_socket) as conn:
+            async with client.nl80211_connect(conn) as wlan:
+                async with client.route_connect(conn) as router:
+                    yield Factory(wlan, router, conn)
+    else:
+        async with nl80211.connect() as wlan:
+            async with route.connect() as router:
+                yield Factory(wlan, router)

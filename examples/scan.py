@@ -3,6 +3,7 @@
 
 import ldn
 import trio
+import os
 
 AcceptPolicies = {
     ldn.ACCEPT_ALL: "ALL",
@@ -23,8 +24,8 @@ Platforms = {
 
 async def main():
     keys = ldn.load_keys("~/.switch/prod.keys")
-    networks = await ldn.scan(keys)
-    
+    networks = await ldn.scan(keys=keys, ldnd_socket=os.environ["LDN_DAEMON"])
+
     print("Found %i network(s)" %len(networks))
     for i, network in enumerate(networks):
         print()

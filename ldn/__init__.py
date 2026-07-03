@@ -1298,7 +1298,10 @@ class STANetwork:
     
     def broadcast_address(self) -> str:
         return f"169.254.{self._network_id}.255"
-    
+
+    async def create_packet_socket(self):
+        return await self._interface.create_packet_socket()
+
     async def next_event(self) -> EventType:
         return await self._events.get()
     
@@ -1890,7 +1893,7 @@ class APNetwork:
 async def scan(
     keys: dict[str, bytes], ifname: str = "ldn", phyname: str = "phy0",
     channels: list[int] = [1, 6, 11], dwell_time: float = .110,
-    protocols: list[int] = [1, 3]
+    protocols: list[int] = [1, 3], ldnd_socket: typing.Optional[str] = None
 ) -> list[NetworkInfo]:
     """Scans for nearbly LDN networks."""
 
@@ -1909,14 +1912,14 @@ async def scan(
         protocol: KeyDerivation(keys, protocol) for protocol in protocols
     }
 
-    async with wlan.create_factory() as factory:
-        async with factory.create_monitor(phyname, ifname) as monitor:
+    async with wlan.create_factory(ldnd_socket) as factory:
+        async with factory.create_monitor(phyname, ifname, channels[0]) as monitor:
             scanner = Scanner(key_derivations, monitor)
             return await scanner.scan(channels, dwell_time)
 
 
 @contextlib.asynccontextmanager
-async def connect(param: ConnectNetworkParam) -> AsyncIterator[STANetwork]:
+async def connect(param: ConnectNetworkParam, ldnd_socket: typing.Optional[str] = None) -> AsyncIterator[STANetwork]:
     """Joins a nearby LDN network."""
 
     param = copy.copy(param)
@@ -1939,7 +1942,7 @@ async def connect(param: ConnectNetworkParam) -> AsyncIterator[STANetwork]:
             network.server_random, param.password
         )
     
-    async with wlan.create_factory() as factory:
+    async with wlan.create_factory(ldnd_socket) as factory:
         async with factory.connect_network(
             param.phyname, param.ifname, network.ssid.hex(), network.channel,
             wlan_key
@@ -1950,7 +1953,7 @@ async def connect(param: ConnectNetworkParam) -> AsyncIterator[STANetwork]:
 
 
 @contextlib.asynccontextmanager
-async def create_network(param: CreateNetworkParam) -> AsyncIterator[APNetwork]:
+async def create_network(param: CreateNetworkParam, ldnd_socket: typing.Optional[str] = None) -> AsyncIterator[APNetwork]:
     """Starts hosting an LDN network."""
 
     param = copy.copy(param)
@@ -1973,7 +1976,7 @@ async def create_network(param: CreateNetworkParam) -> AsyncIterator[APNetwork]:
             param.server_random, param.password
         )
     
-    async with wlan.create_factory() as factory:
+    async with wlan.create_factory(ldnd_socket) as factory:
         async with factory.create_ap(
             param.phyname, param.ifname, param.ssid.hex(),
             param.channel, wlan_key, param.max_participants

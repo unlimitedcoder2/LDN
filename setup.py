@@ -20,7 +20,7 @@ setuptools.setup(
     url = "https://github.com/kinnay/LDN",
     license = "GPLv3",
     platforms = ["Linux"],
-    packages = ["ldn"],
+    packages = ["ldn", "ldn.daemon_client"],
     install_requires = [
         "python-netlink == 0.0.15",
         "pycryptodome"
