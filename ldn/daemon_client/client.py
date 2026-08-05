@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import collections
 import contextlib
 import math
 import struct
@@ -114,11 +115,19 @@ async def _open_connection(path: str) -> WindowsPipeConnection:
     raise NotImplementedError()
 
 
+class _Waiter:
+    __slots__ = ("event", "result")
+
+    def __init__(self) -> None:
+        self.event = trio.Event()
+        self.result: tuple[int, bytes] | None = None
+
+
 class PipeSocket:
     def __init__(self, conn: WindowsPipeConnection):
         self._conn = conn
         self._next_sid = 1
-        self._pending: dict[int, tuple[trio.Event, list]] = {}
+        self._pending: dict[int, collections.deque[_Waiter]] = {}
         self._data_senders: dict[int, trio.MemorySendChannel[bytes]] = {}
         self._out_send, self._out_recv = trio.open_memory_channel(math.inf)
 
@@ -127,33 +136,33 @@ class PipeSocket:
         self._next_sid += 1
         send_chan, recv_chan = trio.open_memory_channel(math.inf)
         self._data_senders[sid] = send_chan
-        ret, _ = await self._request(sid, protocol.OP_SOCKET, domain, type, proto)
-        if ret < 0:
+        status, _ = await self._request(sid, protocol.OP_SOCKET, domain, type, proto)
+        if status != protocol.ERROR_NONE:
             del self._data_senders[sid]
-            raise OSError(-ret, "daemon socket() failed")
+            raise protocol.DaemonError("socket()", status)
         return PipeChannel(self, sid, recv_chan)
 
     def _enqueue_frame(self, op: int, sid: int, a0: int = 0, a1: int = 0,
                         a2: int = 0, blob: bytes = b"") -> None:
-        self._out_send.send_nowait(protocol.pack(op, sid, a0, a1, a2, blob))
+        self._out_send.send_nowait(protocol.pack(op, sid, a0, a1, a2, len(blob), blob))
 
     async def _send_frame(self, op: int, sid: int, a0: int = 0, a1: int = 0,
                            a2: int = 0, blob: bytes = b"") -> None:
-        await self._out_send.send(protocol.pack(op, sid, a0, a1, a2, blob))
+        await self._out_send.send(protocol.pack(op, sid, a0, a1, a2, len(blob), blob))
+
+    def _push_waiter(self, sid: int) -> _Waiter:
+        waiter = _Waiter()
+        self._pending.setdefault(sid, collections.deque()).append(waiter)
+        return waiter
 
     async def _request(self, sid: int, op: int, a0: int = 0, a1: int = 0,
                         a2: int = 0, blob: bytes = b"") -> tuple[int, bytes]:
-        event = trio.Event()
-        box: list = []
-        self._pending[sid] = (event, box)
-        try:
-            await self._send_frame(op, sid, a0, a1, a2, blob)
-            await event.wait()
-        finally:
-            del self._pending[sid]
-        if not box:
+        waiter = self._push_waiter(sid)
+        self._enqueue_frame(op, sid, a0, a1, a2, blob)
+        await waiter.event.wait()
+        if waiter.result is None:
             raise ConnectionError("daemon closed the connection during setup")
-        return box[0]
+        return waiter.result
 
     async def _close_channel(self, sid: int) -> None:
         self._enqueue_frame(protocol.OP_CLOSE, sid)
@@ -163,26 +172,28 @@ class PipeSocket:
 
     async def _read_loop(self) -> None:
         while True:
-            header = await self._conn.recvn(4)
+            header = await self._conn.recvn(protocol.HEADER.size)
             if header is None:
                 await self._shutdown()
                 return
-            (length,) = struct.unpack("<I", header)
-            body = await self._conn.recvn(length)
+            op, sid, a0, a1, a2, blob_len = protocol.parse_frame_header(header)
+            body = await self._conn.recvn(blob_len)
             if body is None:
                 await self._shutdown()
                 return
-            op, sid, a0, _a1, _a2, blob = protocol.parse_body(body)
             if op == protocol.OP_REPLY:
-                pending = self._pending.get(sid)
-                if pending is not None:
-                    pending[1].append((protocol.to_signed(a0), blob))
-                    pending[0].set()
+                queue = self._pending.get(sid)
+                if queue:
+                    waiter = queue.popleft()
+                    waiter.result = (a0, body)
+                    waiter.event.set()
+                    if not queue:
+                        del self._pending[sid]
             elif op == protocol.OP_DATA:
                 sender = self._data_senders.get(sid)
                 if sender is not None:
                     try:
-                        sender.send_nowait(blob)
+                        sender.send_nowait(body)
                     except (trio.BrokenResourceError, trio.WouldBlock):
                         pass
 
@@ -194,8 +205,9 @@ class PipeSocket:
                 pass
 
     async def _shutdown(self) -> None:
-        for event, box in list(self._pending.values()):
-            event.set()
+        for queue in list(self._pending.values()):
+            for waiter in queue:
+                waiter.event.set()
         for sender in list(self._data_senders.values()):
             await sender.aclose()
         await self._out_send.aclose()
@@ -218,21 +230,21 @@ class PipeChannel:
         self._sockname = b""
 
     async def bind(self, addr: bytes) -> None:
-        ret, _ = await self._conn._request(self._sid, protocol.OP_BIND, blob=addr)
-        if ret < 0:
-            raise OSError(-ret, "daemon bind() failed")
+        status, _ = await self._conn._request(self._sid, protocol.OP_BIND, blob=addr)
+        if status != protocol.ERROR_NONE:
+            raise protocol.DaemonError("bind()", status)
 
     async def fetch_sockname(self) -> bytes:
-        ret, blob = await self._conn._request(self._sid, protocol.OP_GETSOCKNAME)
-        if ret < 0:
-            raise OSError(-ret, "daemon getsockname() failed")
+        status, blob = await self._conn._request(self._sid, protocol.OP_GETSOCKNAME)
+        if status != protocol.ERROR_NONE:
+            raise protocol.DaemonError("getsockname()", status)
         self._sockname = blob
         return blob
 
     async def startup(self) -> None:
-        ret, _ = await self._conn._request(self._sid, protocol.OP_START)
-        if ret < 0:
-            raise OSError(-ret, "daemon start failed")
+        status, _ = await self._conn._request(self._sid, protocol.OP_START)
+        if status != protocol.ERROR_NONE:
+            raise protocol.DaemonError("start", status)
 
     def getsockname(self) -> tuple[int, int]:
         return parse_sockaddr_nl(self._sockname)
@@ -244,6 +256,7 @@ class PipeChannel:
             blob = struct.pack("<i", value)
         else:
             blob = bytes(value)
+        self._conn._push_waiter(self._sid)
         self._conn._enqueue_frame(
             protocol.OP_SETSOCKOPT, self._sid, level, optname, 0, blob
         )
@@ -290,7 +303,7 @@ async def _pipe_connect(conn: PipeSocket, family: int):
     await channel.fetch_sockname()
     await channel.startup()
 
-    sock = netlink.NetlinkSocket(channel)
+    sock = netlink.NetlinkSocket(channel) # type: ignore
     async with trio.open_nursery() as nursery:
         nursery.start_soon(sock.start)
         try:

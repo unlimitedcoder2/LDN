@@ -23,7 +23,7 @@ Platforms = {
 }
 
 async def main():
-    keys = ldn.load_keys("~/.switch/prod.keys")
+    keys = ldn.load_keys("prod.keys")
     networks = await ldn.scan(keys=keys, ldnd_socket=os.environ["LDN_DAEMON"])
 
     print("Found %i network(s)" %len(networks))
