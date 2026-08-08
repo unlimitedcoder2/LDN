@@ -1930,7 +1930,9 @@ class Factory:
             await tap.up()
             yield tap
 
-    async def _delete_phy_interfaces(self, wiphy: int) -> None:
+    async def _delete_phy_interfaces(
+        self, wiphy: int, keep_index: int | None = None
+    ) -> None:
         messages = await self._wlan.request(
             nl80211.NL80211_CMD_GET_INTERFACE, flags=netlink.NLM_F_DUMP
         )
@@ -1939,7 +1941,7 @@ class Factory:
             if attributes.get(nl80211.NL80211_ATTR_WIPHY) != wiphy:
                 continue
             index = attributes.get(nl80211.NL80211_ATTR_IFINDEX)
-            if index is None:
+            if index is None or index == keep_index:
                 continue
             if not sys.platform.startswith("linux"):
                 try:
@@ -1955,6 +1957,20 @@ class Factory:
                 {nl80211.NL80211_ATTR_IFINDEX: index}
             )
 
+    async def _find_interface(
+        self, wiphy: int, ifname: str
+    ) -> dict[int, typing.Any] | None:
+        messages = await self._wlan.request(
+            nl80211.NL80211_CMD_GET_INTERFACE, flags=netlink.NLM_F_DUMP
+        )
+        for message in messages:
+            attributes = message.attributes
+            if attributes.get(nl80211.NL80211_ATTR_WIPHY) != wiphy:
+                continue
+            if attributes.get(nl80211.NL80211_ATTR_IFNAME) == ifname:
+                return attributes
+        return None
+
     @contextlib.asynccontextmanager
     async def _create_interface(
         self, phyname: str, ifname: str, type: int,
@@ -1964,13 +1980,27 @@ class Factory:
         Creates an interface on the given phy, with the given name, type and
         additional attributes.
 
-        The interface is deleted when the context manager exits.
+        The interface is deleted when the context manager exits (we keep on windows for now)
 
         Returns the attributes of the newly created interface.
         """
         wiphy = await self._get_wiphy_index(phyname)
 
-        if exclusive:
+        keep = self._daemon is not None
+
+        if keep:
+            existing = await self._find_interface(wiphy, ifname)
+            if existing is not None:
+                if existing.get(nl80211.NL80211_ATTR_IFTYPE) == type:
+                    yield existing
+                    return
+                await self._wlan.request(
+                    nl80211.NL80211_CMD_DEL_INTERFACE,
+                    {nl80211.NL80211_ATTR_IFINDEX:
+                     existing[nl80211.NL80211_ATTR_IFINDEX]}
+                )
+
+        if exclusive and not keep:
             await self._delete_phy_interfaces(wiphy)
 
         attrs = {
@@ -1979,31 +2009,36 @@ class Factory:
             nl80211.NL80211_ATTR_IFTYPE: type,
         }
         attrs.update(extra)
-        
+
         messages = await self._wlan.request(
             nl80211.NL80211_CMD_NEW_INTERFACE, attrs
         )
         attributes = messages[0].attributes
         index = attributes[nl80211.NL80211_ATTR_IFINDEX]
+
+        if keep:
+            await self._router.update_link(
+                socket.AF_UNSPEC, 0, index, IFF_UP, IFF_UP, {}
+            )
+            if exclusive:
+                await self._delete_phy_interfaces(wiphy, keep_index=index)
         try:
             yield attributes
         finally:
-            # On the Windows LKL daemon a running monitor can crash in mt76
-            # drv_stop if it is deleted while RX is still active. Bring the
-            # interface down first so the driver stops RX, then delete it.
-            if not sys.platform.startswith("linux"):
-                try:
-                    await self._router.update_link(
-                        socket.AF_UNSPEC, 0, index, 0, IFF_UP, {}
-                    )
-                except Exception:
-                    pass
-            attrs = {nl80211.NL80211_ATTR_IFINDEX: index}
-            try:
-                await self._wlan.request(nl80211.NL80211_CMD_DEL_INTERFACE, attrs)
-            except Exception:
+            if not keep:
                 if not sys.platform.startswith("linux"):
-                    raise
+                    try:
+                        await self._router.update_link(
+                            socket.AF_UNSPEC, 0, index, 0, IFF_UP, {}
+                        )
+                    except Exception:
+                        pass
+                attrs = {nl80211.NL80211_ATTR_IFINDEX: index}
+                try:
+                    await self._wlan.request(nl80211.NL80211_CMD_DEL_INTERFACE, attrs)
+                except Exception:
+                    if not sys.platform.startswith("linux"):
+                        raise
     
     async def _get_wiphy_index(self, name: str) -> int:
         """Returns the PHY index with the given name."""
