@@ -24,7 +24,8 @@ Platforms = {
 
 async def main():
     keys = ldn.load_keys("prod.keys")
-    networks = await ldn.scan(keys=keys, ldnd_socket=os.environ["LDN_DAEMON"])
+    daemon = os.environ["LDN_DAEMON"] or "\\\\.\\pipe\\ldnd"
+    networks = await ldn.scan(keys=keys, ldnd_socket=daemon)
 
     print("Found %i network(s)" %len(networks))
     for i, network in enumerate(networks):
@@ -55,5 +56,5 @@ async def main():
                 print("\t\tPlatform: %s" %Platforms[participant.platform])
                 print("\t\tConnected: %s" %participant.connected)
                 print("\t\t---")
-        
+
 trio.run(main)
