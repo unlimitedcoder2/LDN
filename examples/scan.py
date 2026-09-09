@@ -24,7 +24,12 @@ Platforms = {
 
 async def main():
     keys = ldn.load_keys("prod.keys")
-    daemon = os.environ["LDN_DAEMON"] or "\\\\.\\pipe\\ldnd"
+    daemon = None
+    try:
+        daemon = os.environ["LDN_DAEMON"]
+    except:
+        daemon = "\\\\.\\pipe\\ldnd"
+        pass
     networks = await ldn.scan(keys=keys, ldnd_socket=daemon)
 
     print("Found %i network(s)" %len(networks))
